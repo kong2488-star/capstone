@@ -1,0 +1,7 @@
+시험 ID 2026-11-16-ina226-01
+주소 스캔 관측값(시험자 보고) 0x40
+
+시리얼 모니터 출력 발췌(시간 접두어 생략)
+Manufacturer ID: 0x5449
+Device ID: 0x2260
+Configuration: 0x4127
