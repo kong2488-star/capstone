@@ -1,0 +1,276 @@
+/*
+ * mppt_bench.ino : 측정 + 컨버터 제어 + 스윕 / P&O / PSO / Hybrid + CSV 출력
+ * 대상: ESP32 (Arduino-ESP32 코어 3.x), INA226 2개(션트 R100), XL4015 FB 주입(IO25)
+ * 상태: 초안. 컴파일과 실물 시험을 하지 않았다.
+ *       같은 논리를 PC에서 단순화한 모델로만 확인했다.
+ *
+ * 시리얼 명령 (115200 bps)
+ *   s      스윕 (n = 0 → 1, 41점)
+ *   p      P&O
+ *   o      PSO만 실행한 뒤 찾은 점에서 유지
+ *   h      Hybrid (PSO → P&O, 전력이 크게 변하면 PSO 재탐색)
+ *   x      정지 (최저 출력으로 복귀)
+ *   d0.35  n을 0.35로 수동 설정
+ *
+ * 탐색 변수 n (0~1): 0 = 전력 요구 최소(패널 전압이 가장 높은 쪽), 1 = 전력 요구 최대.
+ */
+#include <Wire.h>
+
+// ===== 1. 배선 =====
+const int   PIN_SDA0 = 21, PIN_SCL0 = 22;  // INA226 ① 패널 입력, 0x40
+const int   PIN_SDA1 = 16, PIN_SCL1 = 17;  // INA226 ② 컨버터 출력 (버스 분리 시)
+const bool  INA2_ON_BUS1 = true;           // false: ②를 버스 0의 0x41로 읽는다 (주소 패드 납땜)
+const int   PIN_CTL = 25;                  // FB 주입 PWM
+const float R_SHUNT = 0.1f;                // 션트 R100
+
+// ===== 2. 제어 =====
+const bool  USE_VPV_LOOP = false;          // false: 듀티 직접 제어, true: 패널 전압 유지 루프
+const float VPV_HI = 21.0f, VPV_LO = 9.0f; // 전압 유지 루프의 목표 범위 (V)
+const float KP = 0.15f, KI = 0.015f;       // 전압 유지 루프 이득 (듀티/V, 10 ms 주기 기준)
+const uint32_t TS_US = 10000;              // 측정·제어 주기 10 ms
+const uint32_t SETTLE_MS = 300;            // 목표를 바꾼 뒤 대기
+const uint32_t SETTLE_MAX_MS = 1500;       // 전압 유지 루프가 목표에 못 닿을 때의 대기 상한
+const uint32_t AVG_MS = 100;               // 전력 평균 구간
+const int   LOG_DIV = 5;                   // 5주기마다 CSV 1줄 (20 Hz)
+
+// ===== 3. 알고리즘 =====
+const float N_START = 0.10f;               // P&O 시작점
+const float PO_STEP = 0.02f;               // P&O 단독 변화량
+const float PO_STEP_FINE = 0.01f;          // Hybrid 안의 P&O 변화량
+const int   PSO_N = 5, PSO_ITER = 8;       // 입자 수, 최대 반복 수
+const float PSO_W = 0.4f, PSO_C1 = 1.2f, PSO_C2 = 1.6f;
+const float PSO_DONE = 0.03f;              // 입자가 이 범위 안에 모이면 종료
+const float RESEARCH_RATIO = 0.20f;        // 전력이 20% 넘게 변하면 PSO 재탐색
+const float P_MIN = 0.3f;                  // 이 전력(W) 아래에서는 재탐색 판단을 하지 않음
+
+// ===== 상태 =====
+struct Meas { float vpv, ipv, ppv, vout, iout, pout; };
+Meas m = {0, 0, 0, 0, 0, 0};
+float nTarget = 0.0f;        // 탐색 변수 (0~1)
+float duty = 1.0f;           // PWM 듀티 (1 = 최저 출력)
+float vref = VPV_HI;         // 전압 유지 루프의 목표 패널 전압
+float ePrev = 0.0f;
+char  mode = 'x';
+const char *phase = "idle";
+bool  running = false, stopReq = false;
+uint32_t lastTick = 0;
+int   logCnt = 0;
+
+// ===== INA226 =====
+int16_t readReg(TwoWire &bus, uint8_t addr, uint8_t reg) {
+  bus.beginTransmission(addr);
+  bus.write(reg);
+  bus.endTransmission(false);
+  if (bus.requestFrom((int)addr, 2) < 2) return 0;
+  uint16_t hi = bus.read();
+  uint16_t lo = bus.read();
+  return (int16_t)((hi << 8) | lo);
+}
+
+void writeReg(TwoWire &bus, uint8_t addr, uint8_t reg, uint16_t val) {
+  bus.beginTransmission(addr);
+  bus.write(reg);
+  bus.write((uint8_t)(val >> 8));
+  bus.write((uint8_t)(val & 0xFF));
+  bus.endTransmission();
+}
+
+void readSensors() {
+  TwoWire &bus2 = INA2_ON_BUS1 ? Wire1 : Wire;
+  uint8_t addr2 = INA2_ON_BUS1 ? 0x40 : 0x41;
+  m.vpv  = (uint16_t)readReg(Wire, 0x40, 0x02) * 1.25e-3f;       // 버스 전압, 1.25 mV/LSB
+  m.ipv  = readReg(Wire, 0x40, 0x01) * 2.5e-6f / R_SHUNT;        // 션트 전압, 2.5 uV/LSB
+  m.vout = (uint16_t)readReg(bus2, addr2, 0x02) * 1.25e-3f;
+  m.iout = readReg(bus2, addr2, 0x01) * 2.5e-6f / R_SHUNT;
+  m.ppv  = m.vpv * m.ipv;
+  m.pout = m.vout * m.iout;
+}
+
+// ===== 기록 =====
+void logCsv() {
+  int clip = (m.ipv >= 0.80f || m.iout >= 0.80f) ? 1 : 0;        // INA226 측정 한계 근처
+  Serial.printf("%lu,%c,%s,%.3f,%.4f,%.2f,%.3f,%.4f,%.3f,%.3f,%.4f,%.3f,%d\n",
+                (unsigned long)millis(), mode, phase, nTarget, duty, vref,
+                m.vpv, m.ipv, m.ppv, m.vout, m.iout, m.pout, clip);
+}
+
+// ===== 10 ms마다 한 번: 측정 → 전압 유지 루프 → PWM → 기록 =====
+void tick() {
+  uint32_t el = micros() - lastTick;
+  if (el < TS_US) {
+    uint32_t w = TS_US - el;
+    delay(w / 1000);
+    delayMicroseconds(w % 1000);
+  }
+  lastTick = micros();
+
+  readSensors();
+  if (USE_VPV_LOOP) {
+    float e = vref - m.vpv;                 // 패널 전압이 목표보다 낮으면 듀티를 올려 전력 요구를 줄인다
+    duty += KP * (e - ePrev) + KI * e;
+    ePrev = e;
+    duty = constrain(duty, 0.0f, 1.0f);
+  }
+  ledcWrite(PIN_CTL, (uint32_t)(duty * 4095.0f + 0.5f));
+
+  if (++logCnt >= LOG_DIV) { logCnt = 0; logCsv(); }
+  if (running) {
+    while (Serial.available()) {
+      if (Serial.read() == 'x') stopReq = true;
+    }
+  }
+}
+
+void setTarget(float n) {
+  nTarget = constrain(n, 0.0f, 1.0f);
+  if (USE_VPV_LOOP) vref = VPV_HI - nTarget * (VPV_HI - VPV_LO);
+  else              duty = 1.0f - nTarget;
+}
+
+// n으로 옮기고 안정된 뒤의 평균 패널 전력(W)을 돌려준다
+float evalPower(float n) {
+  setTarget(n);
+  uint32_t t0 = millis();
+  while (!stopReq) {
+    uint32_t el = millis() - t0;
+    if (el >= SETTLE_MAX_MS) break;
+    if (el >= SETTLE_MS && (!USE_VPV_LOOP || fabsf(vref - m.vpv) < 0.3f)) break;
+    tick();
+  }
+  float sum = 0.0f;
+  int cnt = 0;
+  t0 = millis();
+  while (!stopReq && millis() - t0 < AVG_MS) { tick(); sum += m.ppv; cnt++; }
+  return cnt > 0 ? sum / cnt : 0.0f;
+}
+
+// ===== 스윕 =====
+void runSweep() {
+  phase = "sweep";
+  for (int i = 0; i <= 40 && !stopReq; i++) {
+    float p = evalPower(i / 40.0f);
+    Serial.printf("# sweep n=%.3f duty=%.3f vpv=%.2f ppv=%.3f vout=%.2f pout=%.3f\n",
+                  nTarget, duty, m.vpv, p, m.vout, m.pout);
+  }
+}
+
+// ===== P&O: 재탐색이 필요하면 true를 돌려준다 =====
+bool runPO(float n, float step, bool allowResearch) {
+  phase = "po";
+  float pPrev = evalPower(n);
+  int dir = 1;
+  while (!stopReq) {
+    n = constrain(n + dir * step, 0.0f, 1.0f);
+    float p = evalPower(n);
+    if (allowResearch && pPrev > P_MIN && fabsf(p - pPrev) > RESEARCH_RATIO * pPrev) return true;
+    if (p < pPrev) dir = -dir;
+    pPrev = p;
+  }
+  return false;
+}
+
+// ===== PSO: 찾은 최적 n을 돌려준다 =====
+float runPSO() {
+  phase = "pso";
+  float pos[PSO_N], vel[PSO_N], pb[PSO_N], pbFit[PSO_N];
+  float gb = 0.5f, gbFit = -1.0f;
+  for (int i = 0; i < PSO_N; i++) {
+    pos[i] = (i + 0.5f) / PSO_N;            // 범위 전체에 고르게 배치
+    vel[i] = 0.0f;
+    pb[i] = pos[i];
+    pbFit[i] = -1.0f;
+  }
+  for (int it = 0; it < PSO_ITER && !stopReq; it++) {
+    for (int i = 0; i < PSO_N && !stopReq; i++) {
+      float f = evalPower(pos[i]);          // 후보마다 새로 측정
+      if (f > pbFit[i]) { pbFit[i] = f; pb[i] = pos[i]; }
+      if (f > gbFit)    { gbFit = f;    gb = pos[i]; }
+    }
+    float spread = 0.0f;
+    for (int i = 0; i < PSO_N; i++) {
+      float r1 = random(1000) / 1000.0f;
+      float r2 = random(1000) / 1000.0f;
+      vel[i] = PSO_W * vel[i] + PSO_C1 * r1 * (pb[i] - pos[i]) + PSO_C2 * r2 * (gb - pos[i]);
+      pos[i] = constrain(pos[i] + vel[i], 0.0f, 1.0f);
+      float d = fabsf(pos[i] - gb);
+      if (d > spread) spread = d;
+    }
+    Serial.printf("# pso it=%d gbest_n=%.3f gbest_p=%.3f spread=%.3f\n", it, gb, gbFit, spread);
+    if (spread < PSO_DONE) break;
+  }
+  return gb;
+}
+
+// ===== Hybrid: PSO → P&O, 전력이 크게 변하면 PSO부터 다시 =====
+void runHybrid() {
+  while (!stopReq) {
+    float gb = runPSO();
+    if (stopReq) break;
+    Serial.printf("# hybrid: PSO -> P&O, n=%.3f\n", gb);
+    if (runPO(gb, PO_STEP_FINE, true)) Serial.println("# hybrid: power changed, PSO again");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(PIN_SDA0, PIN_SCL0);
+  Wire.setClock(400000);
+  if (INA2_ON_BUS1) {
+    Wire1.begin(PIN_SDA1, PIN_SCL1);
+    Wire1.setClock(400000);
+  }
+  ledcAttach(PIN_CTL, 10000, 12);           // 10 kHz, 12비트 (코어 2.x는 ledcSetup + ledcAttachPin)
+  ledcWrite(PIN_CTL, 4095);                 // 최저 출력에서 시작
+
+  TwoWire &bus2 = INA2_ON_BUS1 ? Wire1 : Wire;
+  uint8_t addr2 = INA2_ON_BUS1 ? 0x40 : 0x41;
+  uint16_t id1 = (uint16_t)readReg(Wire, 0x40, 0xFE);
+  uint16_t id2 = (uint16_t)readReg(bus2, addr2, 0xFE);
+  Serial.printf("# INA226 id1=0x%04X id2=0x%04X (expect 0x5449)\n", id1, id2);
+  writeReg(Wire, 0x40, 0x00, 0x4327);       // 평균 4회, 변환 1.1 ms: 약 8.8 ms마다 갱신
+  writeReg(bus2, addr2, 0x00, 0x4327);
+
+  Serial.printf("# vpv_loop=%d ts_us=%lu settle_ms=%lu avg_ms=%lu\n",
+                USE_VPV_LOOP ? 1 : 0, (unsigned long)TS_US,
+                (unsigned long)SETTLE_MS, (unsigned long)AVG_MS);
+  Serial.println("t_ms,mode,phase,n,duty,vref,vpv,ipv,ppv,vout,iout,pout,clip");
+  lastTick = micros();
+}
+
+void loop() {
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 's' || c == 'p' || c == 'o' || c == 'h') {
+      mode = c;
+      stopReq = false;
+      running = true;
+      Serial.printf("# start mode=%c t_ms=%lu\n", c, (unsigned long)millis());
+      float hold = 0.0f;
+      if (c == 's') runSweep();
+      else if (c == 'p') runPO(N_START, PO_STEP, false);
+      else if (c == 'o') hold = runPSO();
+      else runHybrid();
+      running = false;
+      Serial.printf("# end mode=%c t_ms=%lu\n", c, (unsigned long)millis());
+      if (c == 'o' && !stopReq) {
+        phase = "hold";                     // PSO가 찾은 점에서 유지
+      } else {
+        hold = 0.0f;
+        mode = 'x';
+        phase = "idle";
+      }
+      setTarget(hold);
+    } else if (c == 'd') {
+      setTarget(Serial.parseFloat());
+      mode = 'd';
+      phase = "manual";
+    } else if (c == 'x') {
+      setTarget(0.0f);
+      mode = 'x';
+      phase = "idle";
+    }
+  }
+  tick();
+}
+
+
